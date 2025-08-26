@@ -1,0 +1,13 @@
+flask
+flask_cors
+langchain
+langchain_community
+python-dotenv
+sentence-transformers
+chromadb
+Flask
+openai
+googletrans==4.0.0-rc1
+speechrecognition
+pydub
+langchain-groq
