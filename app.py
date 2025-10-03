@@ -11,6 +11,7 @@ from mongoengine import connect
 load_dotenv()
 
 from routes import auth_bp, contact_bp, chatbot_bp , journal_bp # keep this import AFTER load_dotenv
+from routes.admin_doctors import admin_doctors_bp
 
 app = Flask(__name__)
 
@@ -29,10 +30,11 @@ app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "False"
 # ---- CORS ----
 CORS(
     app,
-    resources={r"/api/*": {"origins": os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")}},
+    resources={r"/api/*": {"origins": ["http://localhost:5173"]}},
     expose_headers=["Content-Type", "Authorization"],
-    supports_credentials=False,
+    supports_credentials=True,
 )
+
 
 jwt = JWTManager(app)
 
@@ -66,6 +68,7 @@ app.register_blueprint(auth_bp, url_prefix="/api/auth")
 app.register_blueprint(contact_bp, url_prefix="/api/contact")
 app.register_blueprint(chatbot_bp, url_prefix="/api/chatbot")
 app.register_blueprint(journal_bp, url_prefix="/api/journal")
+app.register_blueprint(admin_doctors_bp, url_prefix="/api/admin")
 
 # ---- Health / 404 ----
 @app.route("/health")

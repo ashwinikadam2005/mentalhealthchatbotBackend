@@ -46,3 +46,30 @@ def login():
             "email": user.email
         }
     })
+
+
+@auth_bp.post("/seed-admin")
+def seed_admin():
+    # Create or update a static admin user
+    email = "admin@example.com"
+    name = "Admin"
+    password = "Admin@123"
+    existing = User.objects(email=email).first()
+    hashed_pw = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    if existing:
+        existing.name = name
+        existing.password = hashed_pw
+        existing.role = "admin"
+        existing.save()
+        created = False
+        user = existing
+    else:
+        user = User(name=name, email=email, password=hashed_pw, role="admin")
+        user.save()
+        created = True
+    return jsonify({
+        "ok": True,
+        "created": created,
+        "email": email,
+        "password": password
+    }), 200

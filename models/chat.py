@@ -1,6 +1,6 @@
 from mongoengine import (
     Document, StringField, ListField, EmbeddedDocument, EmbeddedDocumentField,
-    DateTimeField, ReferenceField
+    DateTimeField, ReferenceField, DictField
 )
 from datetime import datetime
 from .user import User
@@ -16,6 +16,7 @@ class Chat(Document):
     user = ReferenceField(User, required=True, reverse_delete_rule=2)  # CASCADE
     title = StringField(default="New Chat")
     messages = ListField(EmbeddedDocumentField(Message))
+    metadata = DictField(default=dict)   # 👈 New field for age, problem type, severity, etc.
     created_at = DateTimeField(default=datetime.utcnow)
     updated_at = DateTimeField(default=datetime.utcnow)
 
@@ -39,6 +40,7 @@ class Chat(Document):
                     "timestamp": m.timestamp.isoformat() if m.timestamp else None
                 } for m in self.messages
             ],
+            "metadata": self.metadata,  # 👈 include metadata in response
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
