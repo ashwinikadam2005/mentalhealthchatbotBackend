@@ -1,15 +1,19 @@
 from mongoengine import (
     Document, StringField, ListField, EmbeddedDocument, EmbeddedDocumentField,
-    DateTimeField, ReferenceField, DictField
+    DateTimeField, ReferenceField, DictField, BooleanField
 )
 from datetime import datetime
 from .user import User
+from utils.encryption import encryption_service
 
 
 class Message(EmbeddedDocument):
     sender = StringField(required=True, choices=["user", "bot"])
     text = StringField(required=True)
+    encrypted = BooleanField(default=False)
     timestamp = DateTimeField(default=datetime.utcnow)
+    # Optional field present in some stored messages; avoid FieldDoesNotExist
+    animation_type = StringField()
 
 
 class Chat(Document):
@@ -36,8 +40,10 @@ class Chat(Document):
             "messages": [
                 {
                     "sender": m.sender,
-                    "text": m.text,
-                    "timestamp": m.timestamp.isoformat() if m.timestamp else None
+                    "text": encryption_service.decrypt(m.text) if m.encrypted else m.text,
+                    "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+                    "encrypted": m.encrypted,
+                    "animation_type": getattr(m, "animation_type", None)
                 } for m in self.messages
             ],
             "metadata": self.metadata,  # 👈 include metadata in response

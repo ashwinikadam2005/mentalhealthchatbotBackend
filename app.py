@@ -12,6 +12,9 @@ load_dotenv()
 
 from routes import auth_bp, contact_bp, chatbot_bp , journal_bp # keep this import AFTER load_dotenv
 from routes.admin_doctors import admin_doctors_bp
+from routes.admin_users import admin_bp
+from routes.feedback import feedback_bp
+from routes.admin_feedback import admin_feedback_bp
 
 app = Flask(__name__)
 
@@ -69,6 +72,9 @@ app.register_blueprint(contact_bp, url_prefix="/api/contact")
 app.register_blueprint(chatbot_bp, url_prefix="/api/chatbot")
 app.register_blueprint(journal_bp, url_prefix="/api/journal")
 app.register_blueprint(admin_doctors_bp, url_prefix="/api/admin")
+app.register_blueprint(admin_bp, url_prefix="/api/admin_users")
+app.register_blueprint(feedback_bp, url_prefix="/api/feedback")
+app.register_blueprint(admin_feedback_bp, url_prefix="/api/admin")
 
 # ---- Health / 404 ----
 @app.route("/health")

@@ -6,3 +6,7 @@ class ContactMessage(Document):
     email = EmailField(required=True)
     message = StringField(required=True)
     createdAt = DateTimeField(default=datetime.datetime.utcnow)
+
+    meta = {
+        "collection": "contactmessages"  # ensure correct collection
+    }

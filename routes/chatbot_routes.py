@@ -95,123 +95,299 @@
 
 # # routes/chatbot_routes.py
 # from flask import Blueprint, request, jsonify
-# from flask_jwt_extended import jwt_required, get_jwt_identity
-# from models.chat import Chat, Message
-# from models.user import User
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from models.chat import Chat, Message
+from models.user import User
+from utils.encryption import encryption_service
+from utils.youtube_service import youtube_service
+import re
+
+# Helper function to add encrypted message
+def add_encrypted_message(chat, text, sender):
+    encrypted_text = encryption_service.encrypt(text)
+    chat.messages.append(Message(sender=sender, text=encrypted_text, encrypted=True))
+    return chat
+
+# Helper function to check if query is about videos or YouTube
+def is_explicit_youtube_links_request(text):
+    """
+    Detect when the user EXPLICITLY wants YouTube links/URLs listed out.
+    Examples: "suggest youtube videos", "give me youtube links", "show me youtube videos for headache"
+    This takes priority over is_image_request so it never gets mis-routed.
+    """
+    text_lower = text.lower()
+
+    # Strong explicit signals: user says 'youtube' or 'video links' or 'video link'
+    explicit_youtube = any(k in text_lower for k in [
+        'youtube', 'youtubelinks', 'video link', 'video links', 'videos link',
+        'यूट्यूब', 'यूट्यूब लिंक', 'व्हिडिओ लिंक', 'यू ट्यूब'
+    ])
+    if not explicit_youtube:
+        return False
+
+    # Must also have an action/request word (to avoid catching mid-sentence mentions)
+    request_signals = [
+        'suggest', 'give', 'show', 'find', 'send', 'provide', 'recommend', 'share',
+        'list', 'some', 'any', 'search', 'look',
+        'सुझाव', 'दे', 'दिखा', 'भेज', 'खोज', 'द्या', 'दाखवा', 'पाठवा'
+    ]
+    if any(k in text_lower for k in request_signals):
+        return True
+
+    return False
+
+
+def is_video_request(text):
+    """Check if the user is asking for videos (general, non-explicit-link form)."""
+    text_lower = text.lower()
+    # If it's an explicit YouTube links request, handled separately
+    if is_explicit_youtube_links_request(text):
+        return False
+    # Exclude pure animation/image/steps requests
+    if any(k in text_lower for k in ["animated", "animation", "animate", "image", "gif"]):
+        return False
+
+    video_keywords = {
+        'en': ['video', 'youtube', 'watch', 'videos', 'link', 'links'],
+        'hi': ['वीडियो', 'यूट्यूब', 'देखें', 'लिंक', 'वीडियोज'],
+        'mr': ['व्हिडिओ', 'यूट्यूब', 'पहा', 'लिंक', 'व्हिडिओज']
+    }
+    for lang, keywords in video_keywords.items():
+        if any(k in text_lower for k in keywords):
+            return True
+    return False
+
+
+def is_image_request(text):
+    """Check if the user is asking for animations, steps, guides, or images.
+    NEVER fires when the user explicitly asked for YouTube links.
+    """
+    text_lower = text.lower()
+
+    # If user explicitly wants YouTube links, do NOT treat it as an image/animation request
+    if is_explicit_youtube_links_request(text):
+        return False
+
+    # Core multimedia keywords
+    image_keywords = {
+        'en': ['image', 'picture', 'photo', 'animation', 'animate', 'animated', 'gif', 'drawing', 'visual', 'step', 'steps', 'guide', 'how to', 'show me'],
+        'hi': ['चित्र', 'फोटो', 'एनिमेशन', 'एनिमेटेड', 'चरण', 'गाइड', 'राहत'],
+        'mr': ['चित्र', 'फोटो', 'अॅनिमेशन', 'अॅनिमेटेड', 'पायऱ्या', 'मार्गदर्शन', 'आराम']
+    }
+
+    # Action keywords that imply wanting a visual/guide
+    action_keywords = {
+        'en': ['give', 'show', 'create', 'generate', 'want', 'need', 'send', 'provide', 'how to', 'steps', 'step', 'guide', 'demonstrate'],
+        'hi': ['दे', 'दिखा', 'बना', 'चाहिए', 'भेज', 'कैसे'],
+        'mr': ['द्या', 'दाखवा', 'बनवा', 'हवे', 'पाठवा', 'कसे']
+    }
+
+    for lang in image_keywords:
+        has_img = any(k in text_lower for k in image_keywords[lang])
+        has_act = any(k in text_lower for k in action_keywords[lang])
+        if has_img and has_act:
+            return True
+
+    # Direct triggers for common relief/how-to requests
+    direct_triggers = ["show me", "guide me", "show me how", "how to", "steps", "step by step", "calm me"]
+    if any(p in text_lower for p in direct_triggers):
+        return True
+
+    return False
+
+
+def format_youtube_links_response(videos, language="en", topic="mental health"):
+    """
+    Format a clean list of YouTube video links for explicit link requests.
+    Returns only titles + URLs — no embedded iframes.
+    """
+    if isinstance(videos, dict) and "error" in videos:
+        no_video_msgs = {
+            "en": "I'm sorry, I couldn't find any videos at the moment. Please try again later.",
+            "hi": "मुझे खेद है, मैं अभी कोई वीडियो नहीं ढूंढ सका। कृपया बाद में पुनः प्रयास करें।",
+            "mr": "मला माफ करा, मला सध्या कोणतेही व्हिडिओ सापडले नाहीत. कृपया नंतर पुन्हा प्रयत्न करा."
+        }
+        return no_video_msgs.get(language, no_video_msgs["en"])
+
+    # Handle both list-of-dicts from youtube_service and {results:[...]} from search_youtube_videos
+    if isinstance(videos, dict) and "results" in videos:
+        video_list = videos["results"]
+    elif isinstance(videos, list):
+        video_list = videos
+    else:
+        video_list = []
+
+    if not video_list:
+        no_video_msgs = {
+            "en": "I couldn't find relevant videos right now. Please try again later.",
+            "hi": "मुझे अभी कोई वीडियो नहीं मिला। कृपया बाद में पुनः प्रयास करें।",
+            "mr": "मला आत्ता कोणतेही व्हिडिओ सापडले नाहीत. कृपया नंतर पुन्हा प्रयत्न करा."
+        }
+        return no_video_msgs.get(language, no_video_msgs["en"])
+
+    intro_msgs = {
+        "en": f"Here are some helpful YouTube videos for **{topic}**:\n\n",
+        "hi": f"यहाँ **{topic}** के लिए कुछ उपयोगी YouTube वीडियो हैं:\n\n",
+        "mr": f"येथे **{topic}** साठी काही उपयुक्त YouTube व्हिडिओ आहेत:\n\n"
+    }
+    outro_msgs = {
+        "en": "\n\nI hope these videos help you feel better. Remember to consult a healthcare professional if your symptoms persist. 💙",
+        "hi": "\n\nमुझे आशा है कि ये वीडियो आपको बेहतर महसूस करने में मदद करेंगे। यदि लक्षण बने रहें, तो किसी स्वास्थ्य पेशेवर से संपर्क करें। 💙",
+        "mr": "\n\nमला आशा आहे की हे व्हिडिओ तुम्हाला बरे वाटण्यास मदत करतील. लक्षणे कायम राहिल्यास आरोग्य व्यावसायिकांशी संपर्क साधा. 💙"
+    }
+
+    response = intro_msgs.get(language, intro_msgs["en"])
+    for i, video in enumerate(video_list, 1):
+        title = video.get('title', 'Video')
+        url = video.get('url', '')
+        response += f"{i}. 🎬 **{title}**\n   🔗 {url}\n\n"
+    response += outro_msgs.get(language, outro_msgs["en"])
+    return response
+
+# Helper function to extract topic from query
+def extract_video_topic(text):
+    # Detect language first
+    detected_lang = "en"
+    try:
+        # Try to use the YouTube service's language detection
+        from utils import youtube_service
+        yt_service = youtube_service.YouTubeService()
+        detected_lang = yt_service.detect_language(text)
+    except:
+        # Fallback to simple detection
+        if any(word in text.lower() for word in ["मराठी", "मला", "आहे", "नाही"]):
+            detected_lang = "mr"
+        elif any(word in text.lower() for word in ["हिंदी", "मुझे", "है", "नहीं"]):
+            detected_lang = "hi"
+    
+    # Default topic if we can't determine one
+    default_topics = {
+        "en": "mental health",
+        "hi": "मानसिक स्वास्थ्य",
+        "mr": "मानसिक आरोग्य"
+    }
+    default_topic = default_topics.get(detected_lang, "mental health")
+    
+    # Multilingual mental health topics
+    topics = {
+        'stress': {
+            'en': ['stress', 'tension', 'pressure', 'overwhelm', 'burnout'],
+            'hi': ['तनाव', 'टेंशन', 'दबाव', 'परेशानी'],
+            'mr': ['तणाव', 'ताण', 'दबाव', 'तणावातून', 'मुक्त']
+        },
+        'anxiety': {
+            'en': ['anxiety', 'anxious', 'worry', 'panic', 'fear', 'phobia'],
+            'hi': ['चिंता', 'घबराहट', 'डर', 'भय', 'फोबिया'],
+            'mr': ['चिंता', 'काळजी', 'घाबरणे', 'भीती', 'फोबिया']
+        },
+        'depression': {
+            'en': ['depression', 'depressed', 'sad', 'sadness', 'low mood', 'hopeless'],
+            'hi': ['अवसाद', 'उदासी', 'दुःख', 'निराशा'],
+            'mr': ['नैराश्य', 'उदासीनता', 'दुःख', 'निराशा']
+        },
+        'meditation': {
+            'en': ['meditation', 'mindfulness', 'awareness', 'focus', 'concentrate'],
+            'hi': ['ध्यान', 'माइंडफुलनेस', 'जागरूकता', 'एकाग्रता'],
+            'mr': ['ध्यान', 'जागरूकता', 'एकाग्रता', 'लक्ष']
+        },
+        'relaxation': {
+            'en': ['relax', 'calm', 'peace', 'tranquil', 'soothe', 'comfort'],
+            'hi': ['आराम', 'शांति', 'सुकून', 'चैन'],
+            'mr': ['आराम', 'शांतता', 'शांत', 'विश्रांती', 'उपाय']
+        },
+        'sleep': {
+            'en': ['sleep', 'insomnia', 'rest', 'tired', 'fatigue', 'sleepless'],
+            'hi': ['नींद', 'अनिद्रा', 'आराम', 'थकान'],
+            'mr': ['झोप', 'अनिद्रा', 'विश्रांती', 'थकवा']
+        },
+        'yoga': {
+            'en': ['yoga', 'stretch', 'flexibility', 'poses', 'asanas'],
+            'hi': ['योग', 'योगासन', 'आसन', 'लचीलापन'],
+            'mr': ['योग', 'योगासन', 'आसन', 'लवचिकता']
+        },
+        'breathing': {
+            'en': ['breathing', 'breath', 'breathe', 'respiration', 'inhale', 'exhale'],
+            'hi': ['सांस', 'श्वास', 'प्राणायाम'],
+            'mr': ['श्वास', 'श्वासोच्छवास', 'प्राणायाम']
+        },
+        'addiction': {
+            'en': ['addiction', 'substance', 'alcohol', 'drug', 'dependency'],
+            'hi': ['लत', 'नशा', 'शराब', 'ड्रग्स', 'निर्भरता'],
+            'mr': ['व्यसन', 'मद्य', 'अल्कोहोल', 'औषध', 'अवलंबित्व']
+        },
+        'relationships': {
+            'en': ['relationship', 'marriage', 'partner', 'family', 'friend'],
+            'hi': ['रिश्ता', 'शादी', 'पार्टनर', 'परिवार', 'दोस्त'],
+            'mr': ['नाते', 'विवाह', 'जोडीदार', 'कुटुंब', 'मित्र']
+        },
+        'work': {
+            'en': ['work', 'job', 'career', 'workplace', 'professional'],
+            'hi': ['काम', 'नौकरी', 'करियर', 'कार्यस्थल', 'पेशेवर'],
+            'mr': ['काम', 'नोकरी', 'करिअर', 'कार्यस्थळ', 'व्यावसायिक']
+        },
+        'study': {
+            'en': ['study', 'school', 'college', 'university', 'academic', 'exam'],
+            'hi': ['पढ़ाई', 'स्कूल', 'कॉलेज', 'विश्वविद्यालय', 'शैक्षिक', 'परीक्षा'],
+            'mr': ['अभ्यास', 'शाळा', 'कॉलेज', 'विद्यापीठ', 'शैक्षणिक', 'परीक्षा']
+        },
+        'exercise': {
+            'en': ['exercise', 'workout', 'fitness', 'physical activity', 'training'],
+            'hi': ['व्यायाम', 'फिटनेस', 'शारीरिक गतिविधि', 'ट्रेनिंग'],
+            'mr': ['व्यायाम', 'फिटनेस', 'शारीरिक हालचाल', 'प्रशिक्षण']
+        }
+    }
+
+    text_lower = text.lower()
+    
+    # Check for topic keywords in the text based on detected language
+    for topic, lang_keywords in topics.items():
+        # First check keywords in detected language
+        if detected_lang in lang_keywords:
+            for keyword in lang_keywords[detected_lang]:
+                if keyword in text_lower:
+                    return f"{topic} mental health"
+        
+        # Fallback to English keywords
+        if 'en' in lang_keywords:
+            for keyword in lang_keywords['en']:
+                if keyword in text_lower:
+                    return f"{topic} mental health"
+    
+    return default_topic
+
+# Helper function to format YouTube videos as a response
+def format_youtube_response(videos, language="en"):
+    if isinstance(videos, dict) and "error" in videos:
+        error_messages = {
+            "en": "I'm sorry, I couldn't find any videos at the moment. Please try again later.",
+            "hi": "मुझे खेद है, मैं अभी कोई वीडियो नहीं ढूंढ सका। कृपया बाद में पुनः प्रयास करें।",
+            "mr": "मला माफ करा, मला सध्या कोणतेही व्हिडिओ सापडले नाहीत. कृपया नंतर पुन्हा प्रयत्न करा."
+        }
+        return error_messages.get(language, error_messages["en"])
+    
+    intro_messages = {
+        "en": "Here are some YouTube videos that might help you:\n\n",
+        "hi": "यहां कुछ यूट्यूब वीडियो हैं जो आपकी मदद कर सकते हैं:\n\n",
+        "mr": "येथे काही यूट्यूब व्हिडिओ आहेत जे आपल्याला मदत करू शकतात:\n\n"
+    }
+    
+    outro_messages = {
+        "en": "I hope these videos help you feel better. Remember that taking care of your mental health is important.",
+        "hi": "मुझे आशा है कि ये वीडियो आपको बेहतर महसूस करने में मदद करेंगे। याद रखें कि अपने मानसिक स्वास्थ्य का ध्यान रखना महत्वपूर्ण है।",
+        "mr": "मला आशा आहे की हे व्हिडिओ तुम्हाला बरे वाटण्यास मदत करतील. लक्षात ठेवा की तुमच्या मानसिक आरोग्याची काळजी घेणे महत्त्वाचे आहे."
+    }
+    
+    response = intro_messages.get(language, intro_messages["en"])
+    
+    for i, video in enumerate(videos, 1):
+        response += f"{i}. {video['title']}\n"
+        response += f"   {video['url']}\n\n"
+    
+    response += outro_messages.get(language, outro_messages["en"])
+    return response
 # from datetime import datetime
 # import os
-# import openai
-# from dotenv import load_dotenv
-# from googletrans import Translator
-
-# load_dotenv()
-
-# chatbot_bp = Blueprint("chatbot_bp", __name__)
-
-# # Optional OpenRouter config (fallback to echo if no key)
-# openai.api_key = os.getenv("OPENROUTER_API_KEY")
-# openai.api_base = "https://openrouter.ai/api/v1" if os.getenv("OPENROUTER_API_KEY") else None
-
-# translator = Translator()
-
-# def detect_and_translate_to_english(text: str):
-#     detected = translator.detect(text).lang
-#     translated = translator.translate(text, src=detected, dest="en").text
-#     return translated, detected
-
-# def translate_back(text: str, dest_lang: str):
-#     if dest_lang == "en":
-#         return text
-#     return translator.translate(text, src="en", dest=dest_lang).text
-
-# def ask_large_model(prompt: str) -> str:
-#     if openai.api_key and openai.api_base:
-#         try:
-#             resp = openai.ChatCompletion.create(
-#                 model="openai/gpt-3.5-turbo",
-#                 messages=[
-#                     {"role": "system", "content": "You are a supportive multilingual mental health chatbot."},
-#                     {"role": "user", "content": prompt}
-#                 ],
-#                 timeout=30,
-#             )
-#             return resp["choices"][0]["message"]["content"]
-#         except Exception as e:
-#             # fallback to echo
-#             return f"(fallback) You said: {prompt}"
-#     else:
-#         return f"(echo) You said: {prompt}"
-
-# # ---- Routes ----
-
-# @chatbot_bp.route("/chats", methods=["GET"])
-# @jwt_required()
-# def get_chats():
-#     user_id = get_jwt_identity()
-#     user = User.objects(id=user_id).first()
-#     if not user:
-#         return jsonify([]), 200
-#     chats = Chat.objects(user=user).order_by("-updated_at")
-#     return jsonify([c.to_dict() for c in chats]), 200
-
-# @chatbot_bp.route("/new", methods=["POST"])
-# @jwt_required()
-# def new_chat():
-#     user_id = get_jwt_identity()
-#     user = User.objects(id=user_id).first()
-#     if not user:
-#         return jsonify({"error": "User not found"}), 404
-
-#     chat = Chat(user=user, title="New Chat", messages=[])
-#     chat.save()
-#     return jsonify(chat.to_dict()), 201
-
-# @chatbot_bp.route("/process", methods=["POST"])
-# @jwt_required()
-# def process():
-#     data = request.get_json() or {}
-#     text = (data.get("text") or "").strip()
-#     chat_id = data.get("chatId")
-#     user_id = get_jwt_identity()
-
-#     if not text:
-#         return jsonify({"error": "No input provided"}), 400
-
-#     user = User.objects(id=user_id).first()
-#     if not user:
-#         return jsonify({"error": "User not found"}), 404
-
-#     # If no chatId, start a new chat automatically
-#     if chat_id:
-#         chat = Chat.objects(id=chat_id, user=user).first()
-#         if not chat:
-#             return jsonify({"error": "Chat not found"}), 404
-#     else:
-#         chat = Chat(user=user, title="New Chat", messages=[])
-#         chat.save()
-
-#     # Translate -> LLM -> Translate back
-#     translated_text, original_lang = detect_and_translate_to_english(text)
-#     reply_en = ask_large_model(translated_text)
-#     final_reply = translate_back(reply_en, original_lang)
-
-#     # Save messages
-#     chat.messages.append(Message(sender="user", text=text))
-#     chat.messages.append(Message(sender="bot", text=final_reply))
-#     chat.updated_at = datetime.utcnow()
-#     chat.save()
-
-#     return jsonify(chat.to_dict()), 200
-
-# @chatbot_bp.route("/chats/<chat_id>", methods=["GET"])
-# @jwt_required()
-# def get_chat(chat_id):
-#     user_id = get_jwt_identity()
-#     user = User.objects(id=user_id).first()
-#     chat = Chat.objects(id=chat_id, user=user).first()
-#     if not chat:
-#         return jsonify({"error": "Chat not found"}), 404
-#     return jsonify(chat.to_dict()), 200
 
 
 
@@ -228,17 +404,145 @@ from datetime import datetime
 import os
 import openai
 from dotenv import load_dotenv
-import re
 import tempfile
 from gtts import gTTS  # for text-to-speech
 from chatbot_engine import get_chatbot_response  # ✅ PDF QA
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
+# Removed googletrans because it conflicts with groq's httpx version.
+# Using our local FastAPI translator service (port 9000) instead.
+class ServiceTranslator:
+    def translate(self, text, src='auto', dest='en'):
+        try:
+            from urllib.parse import quote_plus
+            r = requests.get(f"http://127.0.0.1:9000/translate?text={quote_plus(text)}&target={dest}", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                from collections import namedtuple
+                return namedtuple("Res", ["text", "src"])(data['translated_text'], data.get('detected_lang', src))
+        except Exception as e:
+            print(f"⚠️ Proxy translation error: {e}")
+        from collections import namedtuple
+        return namedtuple("Res", ["text", "src"])(text, src)
+
+    def detect(self, text):
+        try:
+            from urllib.parse import quote_plus
+            r = requests.get(f"http://127.0.0.1:9000/translate?text={quote_plus(text)}&target=en", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                from collections import namedtuple
+                return namedtuple("Res", ["lang"])(data.get('detected_lang', 'en'))
+        except Exception as e:
+            print(f"⚠️ Proxy detection error: {e}")
+        from collections import namedtuple
+        return namedtuple("Res", ["lang"])("en")
+
+translator = ServiceTranslator()
+import json
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
 chatbot_bp = Blueprint("chatbot_bp", __name__)
 
+# Google Search API configuration
+GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", "")
+GOOGLE_SEARCH_ENGINE_ID = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "")
+
+def perform_google_search(query, num_results=3):
+    """
+    Perform a Google search for the given query and return the results.
+    Falls back to a simple web scraping approach if API keys are not available.
+    Includes robust error handling to prevent failures.
+    """
+    try:
+        # Validate input
+        if not query or not isinstance(query, str):
+            print("Invalid search query provided")
+            return []
+            
+        # Sanitize query
+        sanitized_query = query.strip()
+        if not sanitized_query:
+            return []
+            
+        # First try using Google Custom Search API if keys are available
+        if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID:
+            try:
+                url = f"https://www.googleapis.com/customsearch/v1?key={GOOGLE_SEARCH_API_KEY}&cx={GOOGLE_SEARCH_ENGINE_ID}&q={quote_plus(sanitized_query)}&num={num_results}"
+                response = requests.get(url, timeout=5)  # Add timeout
+                
+                if response.status_code == 200:
+                    results = response.json()
+                    search_results = []
+                    if "items" in results:
+                        for item in results["items"]:
+                            search_results.append({
+                                "title": item.get("title", "No title available"),
+                                "link": item.get("link", ""),
+                                "snippet": item.get("snippet", "No description available")
+                            })
+                    return search_results
+                else:
+                    print(f"Google API error: Status code {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"Google API request error: {str(e)}")
+            except ValueError as e:
+                print(f"Google API JSON parsing error: {str(e)}")
+        
+        # Fallback to a simple search approach with error handling
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            search_url = f"https://www.google.com/search?q={quote_plus(sanitized_query)}"
+            response = requests.get(search_url, headers=headers, timeout=5)  # Add timeout
+            
+            if response.status_code == 200:
+                try:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    search_results = []
+                    
+                    # Extract search results (this is simplified and may need adjustment)
+                    for result in soup.select("div.g")[:num_results]:
+                        try:
+                            title_elem = result.select_one("h3")
+                            link_elem = result.select_one("a")
+                            snippet_elem = result.select_one("div.VwiC3b")
+                            
+                            title = title_elem.text if title_elem else "No title available"
+                            link = link_elem.get("href") if link_elem else ""
+                            snippet = snippet_elem.text if snippet_elem else "No description available"
+                            
+                            if link.startswith("/url?q="):
+                                link = link.split("/url?q=")[1].split("&")[0]
+                            
+                            if title:  # Only require title to be present
+                                search_results.append({
+                                    "title": title,
+                                    "link": link,
+                                    "snippet": snippet
+                                })
+                        except Exception as e:
+                            print(f"Error parsing search result: {str(e)}")
+                            continue
+                    
+                    return search_results
+                except Exception as e:
+                    print(f"Error parsing search results: {str(e)}")
+            else:
+                print(f"Search request failed with status code: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"Search request error: {str(e)}")
+        
+        # If all methods fail, return empty results
+        return []
+    except Exception as e:
+        print(f"Unexpected error in Google search: {str(e)}")
+        return []
+
+# translator is already initialized above as a ServiceTranslator proxy
 
 # Translator microservice endpoint (fallback to direct translation)
 TRANSLATOR_URL = "http://127.0.0.1:9000/translate"
@@ -317,7 +621,7 @@ triage_questions = {
 def detect_user_language(text: str):
     """Detect user's language from their input with robust heuristics.
     - If mostly Latin letters → English
-    - If Devanagari present → Hindi unless Marathi-specific chars present
+    - If Devanagari present → Check for Marathi-specific words/chars else Hindi
     """
     if not text:
         return "en"
@@ -334,9 +638,24 @@ def detect_user_language(text: str):
         return "en"
 
     if devanagari_count > 0:
+        # Marathi specific characters or common Marathi words
         marathi_specific = {'ळ', 'ऱ', 'ॅ', 'य़', 'ॲ', 'ॐ'}
+        marathi_words = [
+            "मी", "माझा", "माझी", "माझे", "आहे", "आहेत", "नाही", "होते", "होती",
+            "आला", "आली", "आले",
+            "मला", "तुला", "आपल्याला", "कसे", "काय", "कुठे", "केव्हा", "जेव्हा", "तेव्हा",
+            "हवे", "हवी", "केले", "केली", "केल्या", "तुमचे", "करायचे", "पाहिजे",
+            # common health words
+            "डोके", "दुखत", "दुखी", "ताण", "तणाव", "चिंता"
+        ]
+        
         if any(ch in marathi_specific for ch in text):
             return "mr"
+            
+        text_words = text.split()
+        if any(word in marathi_words for word in text_words):
+            return "mr"
+            
         return "hi"
 
     return "en"
@@ -358,26 +677,31 @@ openai.api_base = "https://openrouter.ai/api/v1" if openai.api_key else None
 
 # --- Translation helpers (with fallback) ---
 def detect_and_translate_to_english(text: str):
+    """Detect user language and translate input to English using googletrans with robust fallback."""
     try:
-        resp = requests.get(TRANSLATOR_URL, params={"text": text, "target": "en"})
-        data = resp.json()
-        return data["translated_text"], data["detected_lang"]
+        detected = translator.detect(text).lang
     except Exception as e:
-        print(f"⚠️ Translator service error: {e}")
-        # Fallback: simple language detection and translation
-        return translate_with_fallback(text, "en")
+        print(f"⚠️ Language detection error: {e}")
+        detected = detect_user_language(text)
+    try:
+        if detected == "en":
+            return text, "en"
+        translated = translator.translate(text, src=detected, dest="en").text
+        return translated, detected
+    except Exception as e:
+        print(f"⚠️ Translation error: {e}")
+        # Fallback: return original text and detected language
+        return text, detected
 
 def translate_back(text: str, dest_lang: str):
+    """Translate English text back to target language using googletrans; fallback to original on failure."""
     if dest_lang == "en":
         return text
     try:
-        resp = requests.get(TRANSLATOR_URL, params={"text": text, "target": dest_lang})
-        data = resp.json()
-        return data["translated_text"]
+        return translator.translate(text, src="en", dest=dest_lang).text
     except Exception as e:
-        print(f"⚠️ Translator service error: {e}")
-        # Fallback: simple translation
-        return translate_with_fallback(text, dest_lang)
+        print(f"⚠️ Translation back error: {e}")
+        return text
 
 def translate_with_fallback(text: str, target_lang: str):
     """Simple fallback translation for common languages"""
@@ -425,6 +749,81 @@ def translate_with_fallback(text: str, target_lang: str):
     return result
 
 
+# --- Animation intent helper ---
+def detect_animation_intent(text: str, topic_hint: str = ""):
+    tl = (text or "").lower()
+    th = (topic_hint or "").lower()
+    combined = tl + " " + th
+
+    # Head / scalp massage
+    if any(k in combined for k in ["head massage", "scalp massage", "head pain", "massage", "temple", "डोके मालिश", "सिर की मालिश", "माथा"]):
+        return "head_massage"
+    # Headache / pain relief
+    if any(k in combined for k in ["headache", "migraine", "head pain", "सिरदर्द", "डोकेदुखी", "relief", "pain relief"]):
+        return "pain_relief"
+    # Breathing patterns
+    if "4-7-8" in combined or any(k in combined for k in ["breath", "breathing", "inhale", "exhale", "सांस", "श्वसन", "श्वास", "प्राणायाम"]):
+        return "breathing_478"
+    if ("box breathing" in combined) or ("box" in combined and "breath" in combined) or ("बॉक्स" in combined and "श्वास" in combined):
+        return "breathing_box"
+    if any(k in combined for k in ["paced", "resonant", "5/5", "5-5", "equal breathing"]):
+        return "breathing_paced_55"
+    if any(k in combined for k in ["physiological sigh", "huberman", "stress downshift"]):
+        return "breathing_sigh"
+    # Grounding
+    if "grounding" in combined or "5-4-3-2-1" in combined or "ग्राउंडिंग" in combined:
+        return "grounding_54321"
+    # Stretching / chest
+    if any(k in combined for k in ["chest", "shoulder", "posture", "tight chest", "खांदे"]):
+        return "stretching_chest"
+    if any(k in combined for k in ["stretch", "neck", "neck stiffness", "neck pain", "मान"]):
+        return "stretching_neck"
+    # Yoga
+    if any(k in combined for k in ["yoga", "surya namaskar", "sun salutation", "आसन", "योग"]):
+        return "yoga_flow"
+    # Meditation
+    if any(k in combined for k in ["meditate", "meditation", "mindfulness", "dhyan", "ध्यान"]):
+        return "meditation_breath"
+    # Relaxation / stress
+    if any(k in combined for k in ["relax", "stress", "calm", "anxiety", "tension", "तनाव", "ताण", "चिंता"]):
+        return "relaxation_wave"
+    # Sleep / insomnia
+    if any(k in combined for k in ["sleep", "insomnia", "tired", "fatigue", "rest", "झोप", "नींद"]):
+        return "sleep_calm"
+    # Sadness / depression
+    if any(k in combined for k in ["sad", "sadness", "depress", "low mood", "hopeless", "उदास", "नैराश्य"]):
+        return "emotional_calm"
+    return None
+
+
+def pick_animation_for_topic(topic: str, user_text: str = "") -> str:
+    """Always return a sensible animation_type based on detected topic, never None."""
+    anim = detect_animation_intent(user_text, topic_hint=topic)
+    if anim:
+        return anim
+    # Topic-based fallback map
+    topic_map = {
+        "headache": "head_massage",
+        "migraine": "pain_relief",
+        "stress": "relaxation_wave",
+        "anxiety": "breathing_478",
+        "depression": "emotional_calm",
+        "sleep": "sleep_calm",
+        "insomnia": "sleep_calm",
+        "yoga": "yoga_flow",
+        "meditation": "meditation_breath",
+        "breathing": "breathing_478",
+        "relaxation": "relaxation_wave",
+        "sadness": "emotional_calm",
+        "pain": "pain_relief",
+        "massage": "head_massage",
+    }
+    tl = topic.lower()
+    for key, val in topic_map.items():
+        if key in tl:
+            return val
+    return "relaxation_wave"  # universal safe fallback
+
 # --- YouTube helper ---
 def search_youtube_videos(query: str, max_results: int = 5):
     if not YOUTUBE_API_KEY:
@@ -458,24 +857,111 @@ def search_youtube_videos(query: str, max_results: int = 5):
         print(f"⚠️ YouTube search error: {e}")
         return {"error": str(e)}
 
-# --- LLM helper (OpenRouter/OpenAI or echo fallback) ---
+# --- Response formatting helper ---
+def format_response_for_display(text):
+    """
+    Format the chatbot response for better readability and user experience.
+    - Ensures proper line breaks for tips and lists
+    - Makes URLs clickable
+    - Formats doctor information clearly
+    """
+    if not text:
+        return text
+    
+    # First, handle backtick-wrapped URLs (like `http://example.com`)
+    backtick_url_pattern = r'`(https?://[^\s`]+)`'
+    text = re.sub(backtick_url_pattern, r'<a href="\1" target="_blank" style="color:#0066cc; text-decoration:underline;">\1</a>', text)
+    
+    # Then handle regular URLs
+    url_pattern = r'(?<![`"\'])(https?://[^\s]+)(?![`"\'])'
+    text = re.sub(url_pattern, r'<a href="\1" target="_blank" style="color:#0066cc; text-decoration:underline;">\1</a>', text)
+    
+    # Format YouTube links specially with more visible styling
+    youtube_pattern = r'<a href="(https?://(?:www\.)?youtube\.com/[^\s]+)"[^>]*>([^<]+)</a>'
+    text = re.sub(youtube_pattern, r'<a href="\1" target="_blank" style="color:#ff0000; font-weight:bold; text-decoration:underline;">🎬 YouTube: \2</a>', text)
+    
+    # Ensure numbered list items are on separate lines with proper spacing
+    numbered_list_pattern = r'([•\*-]|\d+\.)\s+(.*?)(?=\n[•\*-]|\d+\.|\n\n|$)'
+    
+    def list_item_replacement(match):
+        marker = match.group(1)
+        content = match.group(2)
+        return f"\n{marker} {content}\n"
+    
+    text = re.sub(numbered_list_pattern, list_item_replacement, text, flags=re.DOTALL)
+    
+    # Ensure bullet points are properly formatted
+    bullet_patterns = [
+        (r'•\s+', r'\n• '),  # Bullet points
+        (r'\*\s+', r'\n* '),  # Asterisk bullets
+        (r'-\s+', r'\n- '),   # Dash bullets
+    ]
+    
+    for pattern, replacement in bullet_patterns:
+        text = re.sub(pattern, replacement, text)
+    
+    # Format doctor information blocks
+    doctor_pattern = r'(Dr\.\s+[A-Za-z\s]+)(\n|:)'
+    text = re.sub(doctor_pattern, r'\n\n\1\2', text)
+    
+    # Ensure "Tip" formatting
+    tip_pattern = r'(Tip\s*\d*\s*:)'
+    text = re.sub(tip_pattern, r'\n\1', text)
+    
+    # Ensure proper spacing between sections
+    section_pattern = r'([.!?])\s*\n([A-Z])'
+    text = re.sub(section_pattern, r'\1\n\n\2', text)
+    
+    # Clean up excessive newlines while preserving intentional spacing
+    text = re.sub(r'\n{4,}', '\n\n\n', text)
+    text = re.sub(r'^\n+', '', text)  # Remove leading newlines
+    
+    return text
+
+# --- LLM helper: uses Groq (fast) with OpenRouter as fallback ---
 def ask_large_model(prompt: str) -> str:
-    if openai.api_key and openai.api_base:
-        try:
-            resp = openai.ChatCompletion.create(
-                model="openai/gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a supportive multilingual mental health chatbot."},
-                    {"role": "user", "content": prompt}
-                ],
-                timeout=30,
-            )
-            return resp["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"⚠️ LLM error: {e}")
-            return f"(fallback) You said: {prompt}"
-    else:
-        return f"(echo) You said: {prompt}"
+    try:
+        if not prompt or not isinstance(prompt, str):
+            return "I couldn't understand your question. Please try again."
+
+        system_content = (
+            "You are a compassionate, multilingual mental health assistant. "
+            "Give accurate, empathetic, evidence-based advice. "
+            "Be concise and practical. Format lists with line breaks. "
+            "Always suggest consulting a professional for serious concerns."
+        )
+
+        # ── 1. Try Groq first (fast) ──────────────────────────────────────
+        from chatbot_engine import fast_llm_response
+        groq_reply = fast_llm_response(system_content, prompt, max_tokens=512)
+        if groq_reply:
+            return format_response_for_display(groq_reply)
+
+        # ── 2. Fall back to OpenRouter / OpenAI ──────────────────────────
+        if openai.api_key and openai.api_base:
+            try:
+                resp = openai.ChatCompletion.create(
+                    model="openai/gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt}
+                    ],
+                    timeout=12,
+                )
+                
+                # Get the raw response
+                response_text = resp["choices"][0]["message"]["content"]
+                
+                response_text = resp["choices"][0]["message"]["content"]
+                return format_response_for_display(response_text)
+            except Exception as e:
+                print(f"⚠️ OpenRouter fallback error: {e}")
+                return format_response_for_display("I'm sorry, I'm unable to respond right now. Please consult a healthcare professional.")
+        else:
+            return format_response_for_display("I'm sorry, I'm unable to process your request. Please consult a healthcare professional.")
+    except Exception as e:
+        print(f"⚠️ ask_large_model error: {str(e)}")
+        return "I'm sorry, I encountered an error. Please try again."
 
 
 # ---- Routes ----
@@ -490,18 +976,56 @@ def get_chats():
     chats = Chat.objects(user=user).order_by("-updated_at")
     return jsonify([c.to_dict() for c in chats]), 200
 
+@chatbot_bp.route("/chat/<chat_id>", methods=["DELETE"])
+@jwt_required()
+def delete_chat(chat_id):
+    try:
+        user_id = get_jwt_identity()
+        user = User.objects(id=user_id).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+            
+        chat = Chat.objects(id=chat_id, user=user).first()
+        if not chat:
+            return jsonify({"error": "Chat not found or not authorized"}), 404
+            
+        chat.delete()
+        return jsonify({"message": "Chat deleted successfully"}), 200
+    except Exception as e:
+        print(f"Error deleting chat: {e}")
+        return jsonify({"error": "Failed to delete chat"}), 500
+        
+@chatbot_bp.route("/chats/all", methods=["DELETE"])
+@jwt_required()
+def delete_all_chats():
+    try:
+        user_id = get_jwt_identity()
+        user = User.objects(id=user_id).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+            
+        deleted_count = Chat.objects(user=user).delete()
+        return jsonify({"message": f"All chats deleted successfully", "count": deleted_count}), 200
+    except Exception as e:
+        print(f"Error deleting all chats: {e}")
+        return jsonify({"error": "Failed to delete all chats"}), 500
+
 
 @chatbot_bp.route("/new", methods=["POST"])
 @jwt_required()
 def new_chat():
-    user_id = get_jwt_identity()
-    user = User.objects(id=user_id).first()
-    if not user:
-        return jsonify({"error": "User not found"}), 404
+    try:
+        user_id = get_jwt_identity()
+        user = User.objects(id=user_id).first()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
 
-    chat = Chat(user=user, title="New Chat", messages=[])
-    chat.save()
-    return jsonify(chat.to_dict()), 201
+        chat = Chat(user=user, title="New Chat", messages=[])
+        chat.save()
+        return jsonify(chat.to_dict()), 201
+    except Exception as e:
+        print(f"Error creating new chat: {e}")
+        return jsonify({"error": "Failed to create chat"}), 500
 
 @chatbot_bp.route("/process", methods=["POST"])
 @jwt_required()
@@ -518,17 +1042,363 @@ def process():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # find or create chat
+    # Use existing chat if chat_id is provided
     if chat_id:
         chat = Chat.objects(id=chat_id, user=user).first()
         if not chat:
             return jsonify({"error": "Chat not found"}), 404
     else:
+        # Only create a new chat if absolutely necessary
         chat = Chat(user=user, title="New Chat", messages=[], metadata={})
         chat.save()
 
-    # save user msg
-    chat.messages.append(Message(sender="user", text=text))
+    # save user msg - encrypt the message
+    add_encrypted_message(chat, text, "user")
+
+    # ── Detect language ONCE and reuse throughout this request ──────────
+    detected_lang = chat.metadata.get("user_language", "en")  # start with cached
+    prev_lang = detected_lang
+    # If the user sent numeric-only (or nearly numeric) text, preserve previous language.
+    has_any_letters = bool(re.search(r"[A-Za-z\u0900-\u097F]", text or ""))
+    if not has_any_letters:
+        detected_lang = prev_lang or "en"
+    else:
+        try:
+            detected_lang = translator.detect(text).lang or detected_lang
+        except Exception:
+            detected_lang = detect_user_language(text) or detected_lang
+    chat.metadata["user_language"] = detected_lang
+
+    # ── Translate text to English once (reused by every handler below) ─
+    text_en = text
+    if detected_lang != "en":
+        try:
+            text_en = translator.translate(text, src=detected_lang, dest="en").text or text
+        except Exception as te:
+            print(f"⚠️ translate-to-en error: {te}")
+
+    # --- EXPLICIT YOUTUBE LINKS REQUEST HANDLER (HIGHEST PRIORITY) ---
+    # Fires when user says "suggest youtube links", "give me youtube videos", etc.
+    # Returns ONLY a formatted list of video titles + URLs — no iframes/animations.
+    if is_explicit_youtube_links_request(text_en) or is_explicit_youtube_links_request(text):
+        chat.metadata["triage_complete"] = True
+        topic = extract_video_topic(text_en or text)
+        search_query = f"{topic} relief tips"
+        # Fetch up to 5 videos
+        yt_results = search_youtube_videos(search_query, max_results=5)
+        video_list = yt_results.get("results", []) if isinstance(yt_results, dict) else []
+        if not video_list:
+            # Fallback to youtube_service
+            try:
+                video_list = youtube_service.search_videos(search_query, language=detected_lang, max_results=5)
+            except Exception:
+                video_list = []
+        links_reply = format_youtube_links_response(video_list, language="en", topic=topic)
+        if detected_lang != "en":
+            try:
+                links_reply = translator.translate(links_reply, dest=detected_lang).text
+            except Exception:
+                pass
+        if chat.title == "New Chat":
+            chat.title = f"{topic.capitalize()} Videos"
+        add_encrypted_message(chat, links_reply, "bot")
+        chat.updated_at = datetime.utcnow()
+        chat.save()
+        return jsonify(chat.to_dict()), 200
+
+    # --- MULTIMEDIA / ANIMATION REQUEST HANDLER (STEPS + VISUAL + ONE VIDEO LINK) ---
+    # Fires for "give me steps", "show me how to", "animation", "guide", etc.
+    if is_image_request(text_en) or is_image_request(text):
+        chat.metadata["triage_complete"] = True
+
+        # --- BUILD CONVERSATION MEMORY (last 5 decrypted messages) ---
+        recent_memory = ""
+        try:
+            recent_msgs = chat.messages[-10:]  # last 10 entries
+            memory_lines = []
+            for m in recent_msgs:
+                raw_text = m.text or ""
+                try:
+                    raw_text = encryption_service.decrypt(raw_text)
+                except Exception:
+                    pass
+                # Strip HTML tags for a clean snippet
+                plain = re.sub(r'<[^>]+>', '', raw_text).strip()
+                if plain and len(plain) > 5:
+                    memory_lines.append(f"{m.sender.upper()}: {plain[:200]}")
+            if memory_lines:
+                recent_memory = "\n".join(memory_lines[-6:])  # last 6 lines
+        except Exception:
+            pass
+
+        # Build topic context from triage metadata
+        triage_context = ", ".join(filter(None, [
+            f"problem: {chat.metadata.get('problem', '')}",
+            f"type: {chat.metadata.get('type', '')}",
+            f"duration: {chat.metadata.get('duration', '')}",
+            f"severity: {chat.metadata.get('severity', '')}",
+        ]))
+
+        # Force the model to reply in the user's language to avoid English leakage
+        lang_name = {"en": "English", "hi": "Hindi", "mr": "Marathi"}.get(detected_lang, "English")
+        system_prompt = (
+            "You are an intelligent, compassionate mental health assistant with multimedia generation capabilities.\n"
+            "Analyze the user message carefully, considering their specific problem and conversation history.\n"
+            "Generate a PERSONALIZED response tailored to their exact situation.\n\n"
+            f"IMPORTANT: Reply in {lang_name}. Do not switch languages.\n\n"
+            "Return ONLY valid JSON. Do not include any other text before or after the JSON.\n"
+            "If the user asks for steps, animations, or 'show me how', respond with this JSON:\n"
+            "{\n"
+            "  \"type\": \"animation\" | \"video\" | \"image\",\n"
+            "  \"title\": \"<short descriptive title>\",\n"
+            "  \"text_response\": \"<warm, empathetic intro text>\",\n"
+            "  \"steps\": [\n"
+            "    {\"step\": 1, \"instruction\": \"<clear action step>\", \"animation_hint\": \"<visual motion hint>\"}\n"
+            "  ],\n"
+            "  \"image_prompt\": \"<DALL-E style prompt — be specific to the user's topic, e.g. 'gentle head massage illustration, soft blue tones, step 1: fingertips on temples'>\",\n"
+            "  \"video_query\": \"<YouTube search query specific to user's topic>\"\n"
+            "}"
+        )
+
+        memory_section = f"\n\nConversation history:\n{recent_memory}" if recent_memory else ""
+        context_section = f"\n\nUser triage info: {triage_context}" if triage_context else ""
+        user_input_to_llm = (
+            f"User Request: '{text_en}'"
+            f"{context_section}"
+            f"{memory_section}"
+        )
+        reply_raw = ask_large_model(f"{system_prompt}\n\n{user_input_to_llm}")
+        
+        import json
+
+        def _extract_first_json_object(s: str):
+            """Extract first balanced {...} JSON object substring, else ''."""
+            if not s:
+                return ""
+            start = s.find("{")
+            if start == -1:
+                return ""
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == "\"":
+                        in_str = False
+                    continue
+                else:
+                    if ch == "\"":
+                        in_str = True
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return s[start : i + 1]
+            return ""
+
+        try:
+            # Try to extract JSON from the response (robust balanced-brace extraction)
+            json_blob = _extract_first_json_object(reply_raw)
+            if json_blob:
+                data = json.loads(json_blob)
+                reply_en = data.get("text_response", "I'm here to help you through this.")
+                steps = data.get("steps", [])
+                if steps:
+                    reply_en += "\n\n**Step-by-Step Guide:**\n"
+                    for s in steps:
+                        reply_en += f"**Step {s['step']}:** {s['instruction']}\n"
+            else:
+                # Fallback: strip anything that looks like a JSON section
+                cut_markers = ["json", "JSON", "{"]
+                cut_idx = min([reply_raw.find(m) for m in cut_markers if reply_raw.find(m) != -1] or [-1])
+                reply_en = reply_raw[:cut_idx].strip() if cut_idx != -1 else reply_raw
+        except Exception:
+            # If parsing failed, return only non-JSON part
+            cut_idx = reply_raw.find("{")
+            reply_en = reply_raw[:cut_idx].strip() if cut_idx != -1 else reply_raw
+
+        # Append one real YouTube link for the user to open externally
+        _related_topic = extract_video_topic(text_en or text)
+        try:
+            _yt_one = search_youtube_videos(f"{_related_topic} tutorial", max_results=1)
+            _one_results = _yt_one.get("results", []) if isinstance(_yt_one, dict) else []
+            if not _one_results:
+                _yt_fb = youtube_service.search_videos(f"{_related_topic} tutorial", language="en", max_results=1)
+                _one_results = _yt_fb if isinstance(_yt_fb, list) else []
+            if _one_results:
+                _v = _one_results[0]
+                _vt = _v.get('title', 'Watch on YouTube')
+                _vu = _v.get('url', '')
+                reply_en += f"\n\n🎬 **Recommended video:** [{_vt}]({_vu})\n🔗 {_vu}"
+        except Exception:
+            pass
+
+        if detected_lang != "en":
+            try:
+                final_reply = translator.translate(reply_en, dest=detected_lang).text
+            except Exception: final_reply = reply_en
+        else: final_reply = reply_en
+        
+        # Frontend renders message as HTML; preserve intended line breaks
+        final_reply = (final_reply or "").replace("\n", "<br />")
+
+        # Pick a contextually appropriate animation (UI renders it) — never None
+        _topic_hint = chat.metadata.get("problem", "")
+        _anim_type = pick_animation_for_topic(_topic_hint, user_text=text)
+
+        chat.messages.append(Message(sender="bot", text=final_reply, animation_type=_anim_type))
+        chat.updated_at = datetime.utcnow()
+        chat.save()
+        return jsonify(chat.to_dict()), 200
+
+    # --- YOUTUBE VIDEO REQUEST CHECK (FALLBACK) ---
+    if is_video_request(text):
+        topic = extract_video_topic(text)
+        search_query = f"{topic} videos"
+        videos = youtube_service.search_videos(search_query, language=detected_lang)
+        response = format_youtube_response(videos, language=detected_lang)
+        if chat.title == "New Chat":
+            chat.title = f"{topic.capitalize()} Videos"
+        add_encrypted_message(chat, response, "bot")
+        chat.save()
+        return jsonify(chat.to_dict()), 200
+
+    # --- DOCTOR INFORMATION HANDLER (PRIORITY CHECK) ---
+    normalized_for_doctor = text.strip().lower()
+    doctor_keywords = {
+        "en": ["doctor", "doctors", "therapist", "therapists", "psychiatrist", "psychologist", "counselor", "professional", "specialist", "mental health expert"],
+        "hi": ["डॉक्टर", "चिकित्सक", "मनोचिकित्सक", "मनोवैज्ञानिक", "परामर्शदाता", "विशेषज्ञ", "पेशेवर"],
+        "mr": ["डॉक्टर", "चिकित्सक", "मानसोपचारतज्ञ", "मानसशास्त्रज्ञ", "समुपदेशक", "तज्ञ", "व्यावसायिक"]
+    }
+    doctor_action_keywords = {
+        "en": ["details", "suggest", "recommend", "contact", "information", "info", "list", "find", "need", "want"],
+        "hi": ["विवरण", "सुझाव", "अनुशंसा", "संपर्क", "जानकारी", "सूची", "खोजें", "चाहिए"],
+        "mr": ["तपशील", "सूचवा", "शिफारस", "संपर्क", "माहिती", "यादी", "शोधा", "हवे"]
+    }
+    
+    doctor_keys = doctor_keywords.get(detected_lang, doctor_keywords["en"]) + doctor_keywords["en"]
+    action_keys = doctor_action_keywords.get(detected_lang, doctor_action_keywords["en"]) + doctor_action_keywords["en"]
+    
+    # Check if this is a request for doctor information - must contain both a doctor keyword AND an action keyword
+    # or explicitly asking for doctor/therapist with phrases like "give me doctor" or "show me therapist"
+    if (any(k in normalized_for_doctor for k in doctor_keys) and any(k in normalized_for_doctor for k in action_keys)) or any(f"give me {k}" in normalized_for_doctor or f"show me {k}" in normalized_for_doctor or f"tell me {k}" in normalized_for_doctor for k in doctor_keys):
+        # Fetch doctors from database
+        doctors = [d.to_dict() for d in Doctor.objects().limit(5)]
+        
+        if doctors:
+            doctor_lines = [
+                f"• {d['name']} — {d.get('qualification','')} — {d.get('phone','')}" for d in doctors
+            ]
+            reply_en = "Here are some mental health professionals who can help you:\n" + "\n".join(doctor_lines) + "\n\nThese professionals can provide personalized support and guidance tailored to your specific needs. Reaching out to a mental health professional is an important step in taking care of your wellbeing."
+        else:
+            reply_en = "I don't have any doctor information in my database at the moment. You can find therapists through online directories like Psychology Today, ask your primary care physician for a referral, or check with your health insurance provider for covered therapists. Please consult your local healthcare provider for professional mental health support."
+        
+        # Translate response to user's language
+        try:
+            if detected_lang != "en":
+                final_reply = translator.translate(reply_en, src='en', dest=detected_lang).text
+            else:
+                final_reply = reply_en
+        except Exception as e:
+            print(f"⚠️ Doctor info translation error: {e}")
+            final_reply = reply_en
+            
+        chat.messages.append(Message(sender="bot", text=final_reply))
+        chat.updated_at = datetime.utcnow()
+        chat.save()
+        return jsonify(chat.to_dict()), 200
+    
+    # --- DIRECT QUESTION HANDLER ---
+    # Only run if triage is not currently expecting an answer.
+    # This prevents "age/severity/etc" responses from getting mis-routed.
+    try:
+        _pending_q = None
+        try:
+            _pending_q = next_triage_question(chat)
+        except Exception:
+            _pending_q = None
+        pending_key = (_pending_q or {}).get("key")
+        if _pending_q and not chat.metadata.get("triage_complete"):
+            # Never bypass numeric collection steps
+            if pending_key in {"age", "severity"}:
+                raise StopIteration()
+            # Allow bypass if user clearly describes a problem / asks what to do
+            tl1 = (text or "").lower()
+            tl2 = (text_en or "").lower()
+            combined_tl = f"{tl1} {tl2}"
+            strong_problem_signals = any(k in combined_tl for k in [
+                "what should i do", "what can i do", "help me", "i have", "i'm having",
+                "relief", "headache", "migraine", "anxiety", "stress", "panic", "insomnia",
+                # Marathi/Hindi common asks
+                "मी काय करू", "काय करू", "मला मदत",
+                "माझं डोकं", "डोकं दुखत", "डोक दुखत", "डोके दुखत", "डोकेदुखी", "डोके दुखी",
+                "स्ट्रेस", "तणाव", "ताण", "घालव", "कमी", "शांत",
+                "सिरदर्द", "क्या करूँ", "मुझे मदद"
+            ])
+            if not strong_problem_signals:
+                raise StopIteration()
+
+        direct_question_indicators = [
+            "how", "what", "why", "can", "could", "would", "should", "is", "are", "do", "does",
+            "tell me", "give me", "help me", "need help", "advice", "suggest", "recommend",
+            "help with", "relief from", "suffering from", "ways to", "how to", "tips for",
+            "facing", "having", "got", "get"
+        ]
+        mental_health_terms = [
+            "stress", "anxiety", "depression", "mental health", "therapy", "counseling",
+            "panic", "worry", "fear", "trauma", "ptsd", "ocd", "bipolar",
+            "insomnia", "sleep", "mood", "emotion", "feeling", "suicide", "self-harm",
+            "addiction", "alcohol", "drug", "headache", "pain", "tired", "fatigue",
+            "health", "unwell", "problem", "issue", "symptom", "relief"
+        ]
+        is_direct_request = (
+            "?" in text_en or
+            any(ind in text_en.lower() for ind in direct_question_indicators) or
+            any(term in text_en.lower() for term in mental_health_terms)
+        )
+        if is_direct_request:
+            chat.metadata["direct_question"] = True
+            chat.metadata["triage_complete"] = True
+
+            is_short = any(t in text_en.lower() for t in ["short", "brief", "quick", "concise"])
+            if is_short:
+                llm_prompt = f'User asked: "{text_en}"\nGive a brief, practical answer with 2-3 quick tips. Max 3-4 sentences.'
+            else:
+                llm_prompt = (
+                    f'User asked: "{text_en}"\n'
+                    'Give a compassionate, concise response:\n'
+                    '1. Clear answer to their concern\n'
+                    '2. 2-3 evidence-based coping strategies\n'
+                    '3. Gentle reminder to seek professional help if needed'
+                )
+
+            # Single LLM call (Groq is fast; no PDF call needed)
+            final_res = ask_large_model(llm_prompt)
+            if not final_res:
+                final_res = "I'm here for you. Please speak with a mental health professional for personalised guidance."
+
+            # Translate back once using already-cached detected_lang
+            if detected_lang != "en":
+                try:
+                    final_res = translator.translate(final_res, src="en", dest=detected_lang).text or final_res
+                except Exception as te:
+                    print(f"⚠️ translate-back error: {te}")
+
+            add_encrypted_message(chat, final_res, "bot")
+            chat.updated_at = datetime.utcnow()
+            chat.save()
+            return jsonify(chat.to_dict()), 200
+    except StopIteration:
+        pass
+    except Exception as e:
+        print(f"⚠️ Direct question handler error: {e}")
 
     # --- POST-TRIAGE CONFIRMATION HANDLER ---
     # If we previously asked whether to connect to a professional, interpret yes/no
@@ -560,7 +1430,17 @@ def process():
                 "\n".join(helpline_lines) +
                 "\n\nPlease call your local emergency number if you're in immediate danger."
             )
-            final_reply = translate_back(reply_en, "en")
+            # Translate the response to user's language
+            user_lang = chat.metadata.get("user_language", "en")
+            try:
+                if user_lang != "en":
+                    final_reply = translator.translate(reply_en, src='en', dest=user_lang).text
+                else:
+                    final_reply = reply_en
+            except Exception as e:
+                print(f"⚠️ YouTube translation error: {e}")
+                final_reply = reply_en
+                
             chat.messages.append(Message(sender="bot", text=final_reply))
             chat.updated_at = datetime.utcnow()
             chat.save()
@@ -572,7 +1452,27 @@ def process():
                 "Meanwhile, consider breathing exercises, hydration, and short breaks. "
                 "You can also ask me for coping techniques or resources."
             )
-            final_reply = translate_back(reply_en, "en")
+            # Detect language from the current request
+            detected_lang = "en"
+            try:
+                detected_lang = translator.detect(text).lang
+                # Update the user's language in metadata
+                chat.metadata["user_language"] = detected_lang
+            except Exception as e:
+                print(f"⚠️ YouTube language detection error: {e}")
+                # Fall back to previously stored language if available
+                detected_lang = chat.metadata.get("user_language", "en")
+                
+            # Translate the response to the detected language
+            try:
+                if detected_lang != "en":
+                    final_reply = translator.translate(reply_en, src='en', dest=detected_lang).text
+                else:
+                    final_reply = reply_en
+            except Exception as e:
+                print(f"⚠️ YouTube translation error: {e}")
+                final_reply = reply_en
+            
             chat.messages.append(Message(sender="bot", text=final_reply))
             chat.updated_at = datetime.utcnow()
             chat.save()
@@ -720,7 +1620,7 @@ def process():
                     reply_text = advice_texts.get(user_lang, advice_texts["en"])["severe"]
                     chat.metadata["awaiting_connect_confirmation"] = True
                 
-                chat.messages.append(Message(sender="bot", text=reply_text))
+                add_encrypted_message(chat, reply_text, "bot")
                 chat.updated_at = datetime.utcnow()
                 chat.save()
                 return jsonify(chat.to_dict()), 200
@@ -848,10 +1748,30 @@ def process():
             pass  # Continue to other handlers
 
     # --- GREETING HANDLER (before triage starts) ---
-    if not chat.metadata:
+    # Check if triage has actually started (minimal metadata beyond user_language)
+    triage_keys = ["age", "problem", "triage_complete", "duration", "triggers"]
+    triage_started = any(k in chat.metadata for k in triage_keys)
+    
+    if not triage_started:
         normalized_hi = text.strip().lower()
-        greeting_words = {"hi", "hello", "hey", "hola", "namaste", "good morning", "good evening", "नमस्ते", "नमस्कार", "हाय", "हैलो"}
-        if any(w in normalized_hi for w in greeting_words):
+        # Handle "reset" or "restart" to allow user to start over
+        if any(w in normalized_hi for w in ["reset", "restart", "start over", "reinit", "नवनिर्मिती", "पुन्हा सुरू करा"]):
+            chat.metadata = {}
+            chat.save()
+            return jsonify(chat.to_dict()), 200
+
+        # More robust greeting words in multiple languages
+        greeting_words = {
+            "hi", "hello", "hey", "hola", "namaste", "good morning", "good evening", 
+            "नमस्ते", "नमस्कार", "हाय", "हैलो", "प्रणाम",
+            "नमस्कारा", "सुप्रभात", "शुभ संध्या", "हाय", "हॅलो", "मदत",
+            "शुभ सकाळ", "शुभ दुपार", "शुभ रात्री", "कसे आहात", "कसे आहेस"
+        }
+        # Only treat as greeting if it matches a word or is very short AND NOT a number
+        is_greeting = any(w in normalized_hi for w in greeting_words)
+        is_short_non_numeric = len(text.strip()) < 4 and not text.strip().isdigit()
+        
+        if is_greeting or is_short_non_numeric:
             # Detect user language from greeting
             user_lang = detect_user_language(text)
             chat.metadata["user_language"] = user_lang
@@ -868,19 +1788,26 @@ def process():
             chat.save()
             return jsonify(chat.to_dict()), 200
 
-    # Refresh language each turn cautiously based on current message
+    # Refresh language each turn cautiously based on current message.
+    # IMPORTANT: during numeric triage steps (age/severity), do NOT flip language
+    # even if the user types English letters (e.g., "25 years").
     prev_lang = chat.metadata.get("user_language")
-    # Determine if the message contains any language letters
-    has_letters = bool(re.search(r"[A-Za-z\u0900-\u097F]", text))
-    if has_letters:
-        # If letters present, detect and update
-        chat.metadata["user_language"] = detect_user_language(text)
+    _expecting = None
+    try:
+        _expecting = next_triage_question(chat)
+    except Exception:
+        _expecting = None
+    expecting_key = (_expecting or {}).get("key")
+
+    if expecting_key in {"age", "severity"}:
+        # Keep language stable for numeric collection
+        chat.metadata["user_language"] = prev_lang or "en"
     else:
-        # For numeric/emoji-only inputs, preserve previous language if set
-        if prev_lang:
-            chat.metadata["user_language"] = prev_lang
+        has_letters = bool(re.search(r"[A-Za-z\u0900-\u097F]", text))
+        if has_letters:
+            chat.metadata["user_language"] = detect_user_language(text)
         else:
-            chat.metadata["user_language"] = "en"
+            chat.metadata["user_language"] = prev_lang or "en"
 
     # --- TRIAGE FLOW ---
     q = next_triage_question(chat)
@@ -891,7 +1818,9 @@ def process():
         
         if key == "age":
             try:
-                age_val = int(text.strip())
+                # Accept "माझे वय 25 आहे" style answers too
+                m = re.search(r"\b(\d{1,3})\b", text)
+                age_val = int(m.group(1)) if m else int(text.strip())
                 if age_val <= 0 or age_val > 120:
                     raise ValueError()
                 chat.metadata["age"] = age_val
@@ -908,7 +1837,8 @@ def process():
                 return jsonify(chat.to_dict()), 200
         elif key == "severity":
             try:
-                sev = int(text.strip())
+                m = re.search(r"\b(10|[1-9])\b", text.strip())
+                sev = int(m.group(1)) if m else int(text.strip())
                 if sev < 1 or sev > 10:
                     raise ValueError()
                 chat.metadata["severity"] = sev
@@ -1247,6 +2177,7 @@ def voice_chat():
     # Save chat
     chat = Chat(user=user, title="Voice Chat", messages=[])
     chat.messages.append(Message(sender="user", text=user_text))
+
     chat.messages.append(Message(sender="bot", text=final_reply))
     chat.updated_at = datetime.utcnow()
     chat.save()
